@@ -102,6 +102,7 @@ static int		proxy_fds[32];
 static rad_listen_t	*proxy_listeners[32];
 static void check_for_zombie_home_server(REQUEST *request);
 static void remove_from_proxy_hash(REQUEST *request);
+static int proxy_request(REQUEST *request);
 #else
 #define remove_from_proxy_hash(foo)
 #endif
@@ -889,6 +890,59 @@ static void check_for_zombie_home_server(REQUEST *request)
 	mark_home_server_dead(home, &request->when);
 }
 
+static void mark_home_server_zombie(home_server *home)
+{
+	char buffer[128];
+
+	/*
+	 *	If it's not alive, don't try to make it a zombie.
+	 */
+	if (home->state != HOME_STATE_ALIVE) {
+		/*
+		 *	Don't check home->ev due to race conditions.
+		 */
+		return;
+	}
+
+	/*
+	 *	We've received a real packet recently.  Don't mark the
+	 *	server as zombie until we've received NO packets for a
+	 *	while.  The "1/4" of response window was chosen rather
+	 *	arbitrarily.  It's a balance between too short, which
+	 *	gives quick fail-over and fail-back, or too long,
+	 *	where the proxy still sends packets to an unresponsive
+	 *	home server.
+	 */
+	if ((home->last_packet + ((home->response_window + 2) / 4)) >= now.tv_sec) {
+		return;
+	}
+
+	/*
+	 *	Enable the zombie period when we notice that the home
+	 *	server hasn't responded for a while.  We back-date the
+	 *	zombie period to when we last received a response from
+	 *	the home server.
+	 */
+	home->state = HOME_STATE_ZOMBIE;
+
+	home->zombie_period_start.tv_sec = home->last_packet;
+	home->zombie_period_start.tv_usec = USEC / 2;
+
+	fr_event_delete(el, &home->ev);
+	home->currently_outstanding = 0;
+	home->num_received_pings = 0;
+
+	radlog(L_PROXY, "Marking home server %s port %d as zombie (it looks like it is dead).",
+	       inet_ntop(home->ipaddr.af, &home->ipaddr.ipaddr,
+			 buffer, sizeof(buffer)),
+	       home->port);
+
+	/*
+	 *	Start pinging the home server.
+	 */
+	ping_home_server(home);
+}
+
 static int proxy_to_virtual_server(REQUEST *request);
 
 static int virtual_server_handler(UNUSED REQUEST *request)
@@ -1082,63 +1136,31 @@ static void no_response_to_proxied_request(void *ctx)
 		       request->proxy->dst_port);
 
 		post_proxy_fail_handler(request);
+		mark_home_server_zombie(home);
+
 	} else {
+		/*
+		 * Retransmit to the next server in the same pool.
+		 */
 		rad_assert(request->ev == NULL);
 		request->child_state = REQUEST_RUNNING;
-		wait_a_bit(request);
+
+		mark_home_server_zombie(home);
+		home = home_server_ldb(NULL, request->home_pool, request);
+
+		if (home->server) {
+			proxy_to_virtual_server(request);
+
+		} else {
+			RDEBUG2("Retransmitting request %u (proxy id %d) to home server %s port %d",
+			        request->number, request->proxy->id,
+			        inet_ntop(home->ipaddr.af, &home->ipaddr.ipaddr,
+			                  buffer, sizeof(buffer)),
+			        home->port);
+			remove_from_proxy_hash(request);
+			proxy_request(request);
+		}
 	}
-
-	/*
-	 *	Don't touch request due to race conditions
-	 */
-
-	/*
-	 *	If it's not alive, don't try to make it a zombie.
-	 */
-	if (home->state != HOME_STATE_ALIVE) {
-		/*
-		 *	Don't check home->ev due to race conditions.
-		 */
-		return;
-	}
-
-	/*
-	 *	We've received a real packet recently.  Don't mark the
-	 *	server as zombie until we've received NO packets for a
-	 *	while.  The "1/4" of zombie period was chosen rather
-	 *	arbitrarily.  It's a balance between too short, which
-	 *	gives quick fail-over and fail-back, or too long,
-	 *	where the proxy still sends packets to an unresponsive
-	 *	home server.
-	 */
-	if ((home->last_packet + ((home->zombie_period + 3) / 4)) >= now.tv_sec) {
-		return;
-	}
-
-	/*
-	 *	Enable the zombie period when we notice that the home
-	 *	server hasn't responded for a while.  We back-date the
-	 *	zombie period to when we last received a response from
-	 *	the home server.
-	 */
-	home->state = HOME_STATE_ZOMBIE;
-	
-	home->zombie_period_start.tv_sec = home->last_packet;
-	home->zombie_period_start.tv_usec = USEC / 2;
-	
-	fr_event_delete(el, &home->ev);
-	home->currently_outstanding = 0;
-	home->num_received_pings = 0;
-	
-	radlog(L_PROXY, "Marking home server %s port %d as zombie (it looks like it is dead).",
-	       inet_ntop(home->ipaddr.af, &home->ipaddr.ipaddr,
-			 buffer, sizeof(buffer)),
-	       home->port);
-	
-	/*
-	 *	Start pinging the home server.
-	 */
-	ping_home_server(home);
 }
 #endif
 
